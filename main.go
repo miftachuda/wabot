@@ -16,6 +16,7 @@ import (
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
@@ -29,7 +30,7 @@ type MyClient struct {
 	worker         io.Writer
 	WAClient       *whatsmeow.Client
 	subprocess     *exec.Cmd
-	channel        chan string
+	channel        chan types.JID
 	eventHandlerID uint32
 }
 
@@ -49,15 +50,9 @@ func (mycli *MyClient) myEventHandler(evt interface{}) {
 			})
 		} else {
 			RunCommand("021FI_004.pv\n", mycli.worker)
+			mycli.channel <- v.Info.Sender
 			fmt.Println("param received")
-			fmt.Println(<-mycli.channel)
-			go func() {
-				for range mycli.channel {
-					mycli.WAClient.SendMessage(context.Background(), v.Info.Sender, "", &waProto.Message{
-						Conversation: proto.String(<-mycli.channel),
-					})
-				}
-			}()
+			mycli.channel = make(chan types.JID)
 
 		}
 		// for range mycli.channel {
@@ -71,6 +66,7 @@ func (mycli *MyClient) myEventHandler(evt interface{}) {
 
 func main() {
 	//subprocees init
+	os.Setenv("HTTP_PROXY", "proxyIp:proxyPort")
 	path, _ := filepath.Abs("./worker.exe")
 	cmd := exec.Command(path)
 	stdout, err := cmd.StdoutPipe()
@@ -82,21 +78,6 @@ func main() {
 		panic(err)
 	}
 	//channel
-	ch := make(chan string)
-	go func() {
-		in := bufio.NewReader(stdout)
-		for {
-			sd, err := in.ReadString('\n')
-			if err != nil {
-				return
-			}
-			fmt.Println(sd, "1s")
-			ch <- sd
-		}
-	}()
-	if err := cmd.Start(); err != nil {
-		panic(err)
-	}
 
 	dbLog := waLog.Stdout("Database", "DEBUG", true)
 	// Make sure you add appropriate DB connector imports, e.g. github.com/mattn/go-sqlite3 for SQLite
@@ -109,9 +90,10 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	channel := make(chan types.JID)
 	clientLog := waLog.Stdout("Client", "DEBUG", true)
 	client := whatsmeow.NewClient(deviceStore, clientLog)
-	clients := MyClient{worker: stdin, WAClient: client, subprocess: cmd, channel: ch}
+	clients := MyClient{worker: stdin, WAClient: client, subprocess: cmd, channel: channel}
 	clients.register()
 	if client.Store.ID == nil {
 		// No ID stored, new login
@@ -138,6 +120,22 @@ func main() {
 		}
 	}
 
+	go func() {
+		in := bufio.NewReader(stdout)
+		for {
+			sd, err := in.ReadString('\n')
+			if err != nil {
+				return
+			}
+			clients.WAClient.SendMessage(context.Background(), <-channel, "", &waProto.Message{
+				Conversation: proto.String(sd),
+			})
+			fmt.Println(sd, "1s")
+		}
+	}()
+	if err := cmd.Start(); err != nil {
+		panic(err)
+	}
 	// Listen to Ctrl+C (you can also do something else that prevents the program from exiting)
 	c := make(chan os.Signal)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
