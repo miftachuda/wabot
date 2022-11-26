@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -17,8 +21,15 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+func RunCommand(s string, stdin io.Writer) {
+	io.WriteString(stdin, s)
+}
+
 type MyClient struct {
+	worker         io.Writer
 	WAClient       *whatsmeow.Client
+	subprocess     *exec.Cmd
+	channel        chan string
 	eventHandlerID uint32
 }
 
@@ -28,6 +39,7 @@ func (mycli *MyClient) register() {
 
 func (mycli *MyClient) myEventHandler(evt interface{}) {
 	// Handle event and access mycli.WAClient
+
 	switch v := evt.(type) {
 	case *events.Message:
 		fmt.Println("Received a message!", v.Message.GetConversation())
@@ -35,12 +47,57 @@ func (mycli *MyClient) myEventHandler(evt interface{}) {
 			mycli.WAClient.SendMessage(context.Background(), v.Info.Sender, "", &waProto.Message{
 				Conversation: proto.String("Nice"),
 			})
+		} else {
+			RunCommand("021FI_004.pv\n", mycli.worker)
+			fmt.Println("param received")
+			fmt.Println(<-mycli.channel)
+			go func() {
+				for range mycli.channel {
+					mycli.WAClient.SendMessage(context.Background(), v.Info.Sender, "", &waProto.Message{
+						Conversation: proto.String(<-mycli.channel),
+					})
+				}
+			}()
+
 		}
+		// for range mycli.channel {
+		// 	mycli.WAClient.SendMessage(context.Background(), v.Info.Sender, "", &waProto.Message{
+		// 		Conversation: proto.String(<-mycli.channel),
+		// 	})
+		// }
 	}
 
 }
 
 func main() {
+	//subprocees init
+	path, _ := filepath.Abs("./worker.exe")
+	cmd := exec.Command(path)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		panic(err)
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		panic(err)
+	}
+	//channel
+	ch := make(chan string)
+	go func() {
+		in := bufio.NewReader(stdout)
+		for {
+			sd, err := in.ReadString('\n')
+			if err != nil {
+				return
+			}
+			fmt.Println(sd, "1s")
+			ch <- sd
+		}
+	}()
+	if err := cmd.Start(); err != nil {
+		panic(err)
+	}
+
 	dbLog := waLog.Stdout("Database", "DEBUG", true)
 	// Make sure you add appropriate DB connector imports, e.g. github.com/mattn/go-sqlite3 for SQLite
 	container, err := sqlstore.New("sqlite3", "file:examplestore.db?_foreign_keys=on", dbLog)
@@ -54,7 +111,7 @@ func main() {
 	}
 	clientLog := waLog.Stdout("Client", "DEBUG", true)
 	client := whatsmeow.NewClient(deviceStore, clientLog)
-	clients := MyClient{WAClient: client}
+	clients := MyClient{worker: stdin, WAClient: client, subprocess: cmd, channel: ch}
 	clients.register()
 	if client.Store.ID == nil {
 		// No ID stored, new login
@@ -85,6 +142,9 @@ func main() {
 	c := make(chan os.Signal)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	<-c
+	if err := cmd.Wait(); err != nil {
+		panic(err)
+	}
 
 	client.Disconnect()
 }
