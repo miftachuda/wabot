@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -10,7 +11,9 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
+	ntlm "github.com/bdwyertech/gontlm-proxy/cmd"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
@@ -32,6 +35,7 @@ type MyClient struct {
 	subprocess     *exec.Cmd
 	channel        chan types.JID
 	eventHandlerID uint32
+	callback       func(jid types.JID) types.JID
 }
 
 func (mycli *MyClient) register() {
@@ -43,16 +47,20 @@ func (mycli *MyClient) myEventHandler(evt interface{}) {
 
 	switch v := evt.(type) {
 	case *events.Message:
-		fmt.Println("Received a message!", v.Message.GetConversation())
-		if v.Message.GetConversation() == "halo" {
+		message := v.Message.GetConversation()
+		fmt.Println("Received a message!", message)
+		messagesID := []string{v.Info.ID}
+		mycli.WAClient.MarkRead(messagesID, time.Now(), v.Info.MessageSource.Chat, v.Info.MessageSource.Sender)
+		if message == "halo" {
 			mycli.WAClient.SendMessage(context.Background(), v.Info.Sender, "", &waProto.Message{
 				Conversation: proto.String("Nice"),
 			})
 		} else {
-			RunCommand("021FI_004.pv\n", mycli.worker)
-			mycli.channel <- v.Info.Sender
+			RunCommand(message+"\n", mycli.worker)
+			//mycli.channel <- v.Info.Sender
 			fmt.Println("param received")
-			mycli.channel = make(chan types.JID)
+			mycli.callback(v.Info.Sender)
+			//mycli.channel = make(chan types.JID)
 
 		}
 		// for range mycli.channel {
@@ -64,9 +72,26 @@ func (mycli *MyClient) myEventHandler(evt interface{}) {
 
 }
 
+var senderID types.JID
+
+func cb(jid types.JID) types.JID {
+	senderID = jid
+	return jid
+}
+
+type pv struct {
+	TagName   string
+	TimeStamp string
+	Value     string
+}
+
 func main() {
+	go func() {
+		ntlm.Execute()
+	}()
+	// os.Setenv("HTTP_PROXY", "127.0.0.1:1111")
 	//subprocees init
-	os.Setenv("HTTP_PROXY", "proxyIp:proxyPort")
+	//	os.Setenv("HTTP_PROXY", "proxyIp:proxyPort")
 	path, _ := filepath.Abs("./worker.exe")
 	cmd := exec.Command(path)
 	stdout, err := cmd.StdoutPipe()
@@ -93,11 +118,12 @@ func main() {
 	channel := make(chan types.JID)
 	clientLog := waLog.Stdout("Client", "DEBUG", true)
 	client := whatsmeow.NewClient(deviceStore, clientLog)
-	clients := MyClient{worker: stdin, WAClient: client, subprocess: cmd, channel: channel}
+	clients := MyClient{worker: stdin, WAClient: client, subprocess: cmd, channel: channel, callback: cb}
 	clients.register()
 	if client.Store.ID == nil {
-		// No ID stored, new login
+		time.Sleep(2 * time.Second)
 		qrChan, _ := client.GetQRChannel(context.Background())
+		client.SetProxyAddress("127.0.0.1:1111")
 		err = client.Connect()
 		if err != nil {
 			panic(err)
@@ -113,7 +139,11 @@ func main() {
 			}
 		}
 	} else {
-		// Already logged in, just connect
+		time.Sleep(2 * time.Second)
+		err = client.SetProxyAddress("http://127.0.0.1:1111")
+		if err != nil {
+			panic(err)
+		}
 		err = client.Connect()
 		if err != nil {
 			panic(err)
@@ -127,17 +157,27 @@ func main() {
 			if err != nil {
 				return
 			}
-			clients.WAClient.SendMessage(context.Background(), <-channel, "", &waProto.Message{
-				Conversation: proto.String(sd),
+			var payload string
+			var pvs []pv
+			json.Unmarshal([]byte(sd), &pvs)
+			for i, s := range pvs {
+				if i < len(pvs)-1 {
+					payload += s.TagName + " : " + s.Value + "\n"
+				} else {
+					payload += s.TagName + " : " + s.Value
+				}
+
+			}
+			clients.WAClient.SendMessage(context.Background(), senderID, "", &waProto.Message{
+				Conversation: proto.String(payload),
 			})
-			fmt.Println(sd, "1s")
 		}
 	}()
 	if err := cmd.Start(); err != nil {
 		panic(err)
 	}
 	// Listen to Ctrl+C (you can also do something else that prevents the program from exiting)
-	c := make(chan os.Signal)
+	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	<-c
 	if err := cmd.Wait(); err != nil {
